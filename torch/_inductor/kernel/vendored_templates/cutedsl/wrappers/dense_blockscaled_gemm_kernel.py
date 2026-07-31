@@ -30,11 +30,10 @@ from cutlass.operators.utils.common import tuple_to_string
 from cutlass.operators.utils.device import to_cuda_stream
 from cutlass.operators.utils.tensor import strides_to_layout_string
 
-from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
-    canonical_tensorssa_reduction_type,
-    materialize_tensorssa_reduction,
+from torch._inductor.kernel.gemm_epilogue_codegen import (
+    gemm_epilogue_op_scope,
+    materialize_reduction_callbacks,
 )
-from torch._inductor.kernel.gemm_epilogue_codegen import gemm_epilogue_op_scope
 
 
 log = logging.getLogger(__name__)
@@ -77,6 +76,7 @@ class _ReductionKernelConfig:
     combine: Any
     source: Any
     finalize: Any
+    consumer: Any
 
     def constexprs(self) -> tuple:
         return (
@@ -90,6 +90,7 @@ class _ReductionKernelConfig:
             self.combine,
             self.source,
             self.finalize,
+            self.consumer,
         )
 
 
@@ -230,7 +231,6 @@ try:
     from ..dense_blockscaled_gemm_persistent import (  # pyrefly: ignore[missing-import]
         EpilogueInput,
         EpilogueInputPack,
-        EpilogueOutputPack,
         Sm100BlockScaledPersistentDenseGemmKernel as BlockScaledGemmKernelImpl,
     )
 except ImportError:
@@ -328,17 +328,12 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 for tensor, kind in zip(epilogue.inputs, epilogue.input_kinds)
             )
         )
-        epilogue_outputs = EpilogueOutputPack(
-            epilogue.outputs, epilogue.output_count, epilogue.primary_output
-        )
         reduction_args = args.local_reduce
         local_reduce_out = _local_reduce_abi_tensor(args)
         if reduction_args.primary_enabled:
             local_reduce_feed_out = reduction_args.feed_output
-            reduction = materialize_tensorssa_reduction(
-                canonical_tensorssa_reduction_type(reduction_args.reduction_type),
-                reduction_args.source_type,
-                reduction_args.reduction_type,
+            reduction, consumer, _ = materialize_reduction_callbacks(
+                reduction_args, cute
             )
             reduction_config = _ReductionKernelConfig(
                 reduction_args.group,
@@ -351,6 +346,7 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 reduction.combine,
                 reduction.source,
                 reduction.finalize,
+                consumer,
             )
             return self.cute_compile(
                 self.impl,
@@ -365,7 +361,9 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 self.metadata.operands.out.dtype,
                 alpha,
                 epilogue_inputs,
-                epilogue_outputs,
+                epilogue.outputs,
+                epilogue.output_count,
+                epilogue.primary_output,
                 (
                     local_reduce_out.compile_time_tensor
                     if local_reduce_out is not None
@@ -392,7 +390,9 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             self.metadata.operands.out.dtype,
             alpha,
             epilogue_inputs,
-            epilogue_outputs,
+            epilogue.outputs,
+            epilogue.output_count,
+            epilogue.primary_output,
             target_sm=target_sm,
         )
 
@@ -403,6 +403,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         stream,
         workspace=None,
     ) -> None:
+        import tvm_ffi  # pyrefly: ignore [missing-import]
+
         import torch
 
         stream = to_cuda_stream(stream)
@@ -424,9 +426,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                     for tensor, kind in zip(epilogue.inputs, epilogue.input_kinds)
                 )
             )
-            epilogue_outputs = EpilogueOutputPack(
-                epilogue.outputs, epilogue.output_count, epilogue.primary_output
-            )
+            epilogue_inputs = tvm_ffi.convert(dataclasses.astuple(epilogue_inputs))
+            epilogue_outputs = tvm_ffi.convert(epilogue.outputs)
 
         reduction = args.local_reduce
         logical_reduce_out = reduction.output

@@ -1,12 +1,16 @@
 # mypy: allow-untyped-defs
 """Shared CuTeDSL emission primitives for GEMM epilogues."""
 
+import ast
+import dataclasses
 from typing import Any
 
 import torch
 from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
+    canonical_tensorssa_reduction_type,
     CuteDSLCSEVariable,
     CuteDSLOpOverrides,
+    materialize_tensorssa_reduction,
 )
 from torch.utils._sympy.value_ranges import ValueRanges
 
@@ -33,6 +37,46 @@ def gemm_epilogue_op_scope(cute: Any) -> dict[str, Any]:
         "silu": lambda x: x * sigmoid(x),
         "tanh": cute.math.tanh,
     }
+
+
+def with_reduction_finalizer(reduction: Any, source: str | None, cute: Any) -> Any:
+    if source is None:
+        return reduction
+    fn_name = next(
+        node.name
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef)
+    )
+    scope = gemm_epilogue_op_scope(cute)
+    exec(source, scope)
+    return dataclasses.replace(reduction, finalize=scope[fn_name])
+
+
+def materialize_reduction_consumer(source: str | None, cute: Any) -> Any:
+    if source is None:
+        return None
+    fn_name = next(
+        node.name
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef)
+    )
+    scope = gemm_epilogue_op_scope(cute)
+    exec(source, scope)
+    return scope[fn_name]
+
+
+def materialize_reduction_callbacks(args: Any, cute: Any) -> tuple[Any, Any, Any]:
+    reduction = materialize_tensorssa_reduction(
+        canonical_tensorssa_reduction_type(args.reduction_type),
+        args.source_type,
+        args.reduction_type,
+    )
+    reduction = with_reduction_finalizer(reduction, args.finalizer_fn, cute)
+    return (
+        reduction,
+        materialize_reduction_consumer(args.consumer_fn, cute),
+        materialize_reduction_consumer(args.secondary_consumer_fn, cute),
+    )
 
 
 class GemmEpilogueCuteDSLBody:
